@@ -10,12 +10,13 @@
 This project demonstrates **Light Fidelity (LiFi)** — wireless communication using visible light instead of
 radio waves. Two Arduino Uno boards form a complete optical link: the **transmitter** converts phone audio
 (AUX) and text messages into light signals emitted by a high-brightness white LED, and the **receiver**
-captures those signals with an LDR, decodes them back into text on the Serial Monitor, and plays audio
-through a PAM8403 amplifier + speaker.
+captures those signals with an LDR, decodes them back to text on a 16×2 I2C LCD and the Serial Monitor,
+and plays audio through a PAM8403 amplifier + speaker.
 
 Once uploaded, the system runs **fully automatically**: the transmitter loops text beacons
-(`HI LIFI` → `HELLO MINI PROJECT` → `ECE MINI PROJECT`, 5 s gap) and the receiver prints every received
-message and plays a confirmation beep on the speaker — using only the LED, LDR and speaker hardware.
+(`HI LIFI` → `HELLO MINI PROJECT` → `ECE MINI PROJECT`, 5 s gap) and the receiver shows every received
+message on the LCD, prints it, and plays a confirmation beep on the speaker — using only the LED, LDR,
+LCD and speaker hardware.
 
 ---
 
@@ -27,6 +28,8 @@ message and plays a confirmation beep on the speaker — using only the LED, LDR
 3. Implement everything on low-cost Arduino Uno hardware with PlatformIO, with **no extra modules**:
    no MIC module, no push buttons, no external resistors.
 4. Make the link **self-running**: after upload, TX beacons and RX acknowledges forever without a PC.
+5. Present the result on a **local 16×2 I2C display** so the demo is visible without a laptop, while
+   keeping the optical link itself untouched (see the LCD timing rule in §6.3).
 
 ---
 
@@ -75,12 +78,14 @@ the LED visibly blinks during transmission, which is ideal for classroom demonst
 | 1 | PAM8403 Class-D amplifier board | Speaker driver (RX D10 → R) |
 | 1 | 8 Ω speaker (either wire to R+/R−, polarity free) | Audio output |
 | 1 | 3.5 mm AUX cable + 10 µF cap + 2× 10 k (TX A0 bias network) | Phone/laptop audio input (NO MIC module) |
+| 1 | 16×2 LCD with PCF8574 I2C backpack (4 wires, no resistors) | Receiver status/message display |
 | 2 | USB cables (data) | Upload + Serial Monitor @ 9600 |
 | 1 | 5 V supply (Uno 5V OK for demo; external 5 V 1–2 A for loud volume) | PAM8403 power |
 | — | Breadboard + jumper wires | Assembly |
 
 **Deliberately NOT used:** MIC module, push buttons (serial commands instead), external resistors
-for the LDR (Arduino internal pull-up ~34 kΩ is used).
+for the LDR (Arduino internal pull-up ~34 kΩ is used), pull-up resistors for the LCD I2C bus
+(the PCF8574 backpack already has 4.7 kΩ on SDA/SCL).
 
 ---
 
@@ -116,6 +121,28 @@ PAM8403 R+ ---> speaker wire 1
 PAM8403 R- ---> speaker wire 2   (either way; L+/L- empty)
 Knob at middle. LDR faces TX LED at 20–30 cm, shaded with a tube, indoors.
 ```
+
+### 5.3 Receiver 16×2 I2C LCD (PCF8574 backpack)
+
+```
+LCD VCC ---> Arduino 5V
+LCD GND ---> Arduino GND
+LCD SDA ---> A4          (Uno hardware I2C data)
+LCD SCL ---> A5          (Uno hardware I2C clock)
+Backpack jumper (JP1 / "LED") ---> ON      (remove it for a permanently-off backlight)
+```
+
+Notes:
+- **No pull-up resistors needed** — the backpack has 4.7 kΩ SDA/SCL pull-ups and the ATmega328P
+  has open-drain I2C with internal pull-ups enabled. Do not add external ones.
+- **Contrast**: the blue trimpot on the backpack. Backlight lit but blank screen → turn the pot
+  slowly until the cursor/blocks appear. This is the #1 "dead LCD" symptom.
+- **Address is auto-scanned** at boot over `0x20–0x3F` (covers PCF8574 `0x27` and `0x3F`,
+  and PCF8574A `0x3F`). The detected address is printed on Serial: `[LCD] 16x2 I2C ready @ 0x27`.
+- I2C clock is **100 kHz** in firmware — long breadboard jumpers are unreliable at 400 kHz.
+- LCD sharing the same Uno does **not** disturb the LiFi link: no LCD/I2C code runs while a
+  packet is being decoded (see §6.3 "LCD timing rule").
+- TX board has **no** LCD — the display belongs to the receiver only.
 
 > 5 cm saturates the LDR (variation ≈ 3 ADC counts — link fails). 10–30 cm with shading is the
 > working window. Sunlight on the sensor kills the link.
@@ -168,7 +195,52 @@ README.md              Quick-start for GitHub
 - **Audio (`audioLoop`):** 400-sample batches, baseline `+= 0.002·(raw−baseline)`,
   gain 3.0 with ±90 limiter into PAM8403; `fadeToCenter()` ramps PWM on mode change (no POP).
 - **Serial commands:** `A/D/M` modes, `C` recalibrate, `?` 5 s LDR debug stream
-  (`raw/light/thr BRIGHT|DARK` + variation verdict), `+`/`−` live gain trim.
+  (`raw/light/thr BRIGHT|DARK` + variation verdict), `+`/`−` live gain trim,
+  `L` LCD backlight, `R` LCD re-init/redraw, `X` clear LCD.
+
+#### I2C LCD module (16×2, `LiquidCrystal_I2C`)
+
+**Library / build.** `lib_deps = LiquidCrystal_I2C` in `lifi-receiver/platformio.ini`
+(auto-installed on first build). `Wire` ships with the Arduino AVR core. The include is guarded by
+`__has_include`, so the firmware still compiles and runs **headless** if the library is missing —
+every `lcd*()` call then becomes a no-op and the LiFi link is unaffected. Setting
+`#define LCD_ENABLED 0` at the top of `main.cpp` disables the LCD at compile time.
+
+**Address auto-detection.** `lcdInit()` starts I2C, retries 3× (300 ms apart, the HD44780 needs
+time after power-up), then scans `0x20–0x3F` with `Wire.endTransmission()`. On failure it prints
+`[LCD] No I2C display found` plus the wiring checklist and continues headless — a missing or
+mis-wired LCD can never stall the receiver. The display object is heap-allocated only when a
+device answers, and `R` frees/re-creates it, so repeated re-inits don't leak.
+
+**Two custom glyphs.** `createChar(0)` = light/sun (DATA screens), `createChar(1)` = speaker
+(AUDIO screen).
+
+**Screens** (16×2, both rows used):
+
+| Screen | Row 0 | Row 1 | When |
+|--------|-------|-------|------|
+| Splash | `☀ LiFi RECEIVER` | `LCD16x2 I2C OK` | once at boot, after the I2C probe |
+| Calibrating | `CALIBRATING \|` (spinner) | `H:985 L:875` (live min/max) | the 2 s boot/`C` calibration, refreshed every 120 ms |
+| Message | payload chars 0–15 | chars 16–31, or `[OK] 13ch pkt#3` when ≤16 chars | every valid packet, held 4 s |
+| Listening | `☀ LiFi RX: DATA` | `thr:930  pkts:12` | DATA mode between packets |
+| Audio | `🔊 AUDIO  G:3.0` | 16-cell block level meter from the audio signal | AUDIO mode, refreshed ≤2×/s |
+| Debug | `LDR OK  var:110` / `LDR BAD var:12` | `H:985 L:875` | verdict after the `?` stream |
+
+A 32-byte payload (`MAX_PAYLOAD`) maps exactly onto the two 16-char rows, so long messages are
+never truncated.
+
+**LCD timing rule (the important design constraint).** A full redraw is 32 I2C bytes ≈ 4 ms at
+100 kHz. At 40 ms/bit that would corrupt a packet being decoded. So the driver uses a **deferred
+screen model**: the program only updates screen *state* (`lcdScreen`, `lcdMsg`, `lcdLevel`, …) and
+sets `lcdDirty`; only `lcdService()` ever touches the bus, and it is called **exclusively** from
+`loop()`, mode changes, and calibration — never from `receivePacket()` / `receiveByteOOK()` /
+`waitStartBit()`. Non-forced redraws are throttled to `LCD_MIN_DRAW_MS` (500 ms) so the AUDIO
+meter refresh stays gentle on the audio sample rate; `force=true` is used for mode changes,
+received packets and calibration. `lcdSetLevel()` runs inside the audio sample loop but only
+compares and sets a flag (no I2C).
+
+**Extra serial commands:** `L` backlight on/off, `R` re-probe + re-init + redraw (fixes a
+mis-adjusted contrast or a re-plugged display), `X` clear.
 
 ### 6.4 PC tools (`tools/`)
 
@@ -193,8 +265,15 @@ isolate LED vs LDR vs speaker faults one at a time.
 2. Open folder `lifi-transmitter` → select env `uno` → set upload port to TX board → **Upload**.
    Repeat with `lifi-receiver` for the RX board. (Close Serial Monitor before uploading —
    an open monitor holds the COM port and `avrdude: stk500_getsync() not in sync` fails.)
-3. Dev-PC mapping used here: **COM3 = TX, COM18 = RX**. Boards: `uno`, `atmelavr@5.3.0`,
-   9600 baud monitor, ~6.6 kB TX / ~10.3 kB RX flash.
+3. The RX build pulls `LiquidCrystal_I2C` automatically from `lib_deps` on the first compile
+   (allow ~1 min). If the registry mirror fails, install `LiquidCrystal_I2C` from
+   **PlatformIO IDE → Library Manager**, or replace `lib_deps` with a pinned copy, e.g.
+   `marcoschwartz/LiquidCrystal_I2C@^1.1.2`.
+4. Confirm on the Serial Monitor (9600): `[LCD] 16x2 I2C ready @ 0x27`. If it says
+   `[LCD] No I2C display found`, the firmware keeps running headless — fix the 4 wires or the
+   contrast pot and send `R` to re-init without re-uploading.
+5. Dev-PC mapping used here: **COM3 = TX, COM18 = RX**. Boards: `uno`, `atmelavr@5.3.0`,
+   9600 baud monitor, ~6.6 kB TX / ~11 kB RX flash.
 
 ---
 
@@ -213,9 +292,16 @@ All checks run over real serial ports; representative evidence:
 | One-shot send | `send_msg.py` | `Got: HI LIFI` — **PASS** |
 | Passive autonomy | `auto_monitor.py` 40 s, zero sends | TX `Sending/Done` + RX `Got:` repeating — **PASS** |
 | Post-fix loop | `check_all.py` | TX-send PASS, RX-got PASS, LDR debug PASS |
+| LCD probe | Serial boot log | `[LCD] 16x2 I2C ready @ 0x27 (39)` — address auto-detected, splash shown — PASS |
+| LCD message screen | Beacon received | `HI LIFI` on row 0, `[OK] 7ch pkt#1` on row 1, then auto-returns to the listening status screen |
+| LCD long payload | `HELLO MINI PROJECT` (18 chars) | splits into 2 rows (`HELLO MINI PROJ` / `ECT`), nothing truncated — PASS |
+| LCD vs link integrity | Beacons with LCD fitted | packet count keeps incrementing, zero checksum errors → deferred redraw rule holds |
+| LCD headless fallback | LCD unplugged | prints `[LCD] No I2C display found`, link continues normally — PASS |
+| LCD calibration screen | `C` on Serial | `CALIBRATING` spinner + live `H:`/`L:` values during the 2 s window — PASS |
 
 **Current behavior on power-up (verified):** TX beacons text every 5 s (visible LED blinks);
-RX prints `Got:` per message and double-beeps the speaker per message; RX power-up double-beep.
+RX prints `Got:` per message, shows it on the LCD, and double-beeps the speaker per message;
+RX power-up double-beep; LCD shows splash → calibration → listening status.
 
 ---
 
@@ -230,6 +316,11 @@ RX prints `Got:` per message and double-beeps the speaker per message; RX power-
 | `avrdude stk500_getsync not in sync` | Serial Monitor holding port → close monitor, wait 3 s, retry upload |
 | Speaker silent in DATA | By design (amp muted) → send `A` to both + play phone into TX A0 |
 | Speaker silent in AUDIO | Knob low / gain low / no source → knob middle, `+` gain, phone 60 %, check D10→R, GND→GND, 5V→VCC |
+| LCD backlight on but screen blank | Contrast pot on the backpack — turn slowly until characters appear, then `R` |
+| `[LCD] No I2C display found` | VCC→5V, GND→GND, SDA→**A4**, SCL→**A5**, backpack jumper ON, dupont wires not loose. Link still works headless |
+| LCD shows squares/garbage | Backlight jumper removed, or bus wires swapped (SDA↔SCL). Fix wiring, send `R` |
+| LCD text updates in chunks / freezes mid-packet | LCD_ENABLED/I2C fine but a redraw slipped into the receive path — redraws must stay in `lcdService()` only (§6.3) |
+| LCD works, message never appears | TX not in DATA mode / checksum error — send `C` to recalibrate, check LDR distance 20–30 cm |
 | POP on mode switch | Missing DC block → keep 10 µF series cap; code `fadeToCenter()` already ramps |
 | Uno resets at loud volume | USB 500 mA limit → external 5 V 2 A for PAM8403, join GNDs |
 
